@@ -18,7 +18,7 @@ CONFIG = {
     # --- qBittorrent 配置 ---
     "QBIT_URL": "http://localhost:8080",
     "QBIT_USER": "admin",       # 默认是 admin
-    "QBIT_PASS": "12310477",  # 默认是 adminadmin，建议修改
+    "QBIT_PASS": "admin",  # 默认是 adminadmin，建议修改
     "DOWNLOAD_DIR": "/root/downloads",
     
     # --- Rclone 配置 ---
