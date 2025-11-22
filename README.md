@@ -1,4 +1,5 @@
 开源个小玩意，专门用于在空间不太够的vps上搬东西到云盘。
+<img width="1139" height="674" alt="image" src="https://github.com/user-attachments/assets/2d3bff11-62ed-4863-8952-2915ceadb538" />
 
 简单来说，如果你的 VPS 只有 10G 或者 20G 的硬盘，但你却想挂 PT 或者下载 BT 的大文件并转存到 OneDrive/Google Drive/123pan...，这个脚本就是为你准备的。我使用的是 OD+123Pan，比较正常。
 
