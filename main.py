@@ -6,6 +6,8 @@ import json
 import shutil
 import logging
 import subprocess
+import posixpath
+from urllib.parse import urlparse
 import requests
 from flask import Flask, request, jsonify, render_template_string
 from sqlalchemy import create_engine, Column, Integer, String, Float, event
@@ -34,7 +36,12 @@ CONFIG = {
     # 作用：防止死种或龟速文件长时间占用宝贵的硬盘空间
     "ZOMBIE_MAX_LIFETIME": 24 * 3600, # 12小时下不完 -> 杀
     "ZOMBIE_MIN_SPEED": 10 * 1024,    # 平均速度低于 20KB/s -> 杀
-    "ZOMBIE_WARMUP": 240 * 60,         # 给种子 15分钟 预热时间，期间不杀低速
+    "ZOMBIE_WARMUP": 240 * 60,         # 给种子预热时间
+    "UPLOAD_RETRY_DELAY": 60,
+    "UPLOAD_MAX_RETRIES": 5,
+    "QBIT_TIMEOUT": 15,
+    "VERIFY_UPLOAD_SIZE": True,
+    "UPLOAD_TIMEOUT": 3600,
 }
 
 # --- Rclone 优化参数 (针对国内/OneDrive/GoogleDrive) ---
@@ -51,17 +58,12 @@ RCLONE_FLAGS = [
     "--use-mmap",                 
     
     # 3. 云盘 API 优化 (修复 OneDrive 报错)
-    "--drive-chunk-size=128M",    # Google Drive: 128M 没问题 (2的幂次)
-    "--onedrive-chunk-size=125M", # OneDrive: 必须是 320KB 倍数 -> 125M 是合法的 (128M 非法)
-    "--onedrive-no-versions",     # 不保留历史版本，加速覆盖/删除
     
     # 4. 稳定性与速度
     "--timeout=10m", 
     "--retries=10",
     "--low-level-retries=20",
     "--stats-one-line",
-    "--ignore-errors",
-    "--no-check-certificate",
     "--no-traverse"               # 不扫描目录，直接传，秒开始
 ]
 # ==============================================================================
@@ -135,6 +137,7 @@ Base.metadata.create_all(engine)
 class QbitClient:
     def __init__(self):
         self.s = requests.Session()
+        self.api_version = None
         # 增加 Header 伪装，防止某些版本拦截
         self.s.headers.update({
             'User-Agent': 'Mozilla/5.0', 
@@ -144,64 +147,79 @@ class QbitClient:
         if not self.login():
             logger.error("❌ 无法连接到 qBittorrent，请检查配置或服务是否启动")
             sys.exit(1)
-        self.apply_optimizations()
+        # Never modify global qBittorrent preferences implicitly.
+        self.detect_api()
 
     def login(self):
         try:
             # 尝试访问首页获取 Cookie (CSRF token 需要)
-            self.s.get(self.base_url) 
+            self.s.get(self.base_url, timeout=15)
             r = self.s.post(f"{self.base_url}/api/v2/auth/login", data={
                 'username': CONFIG["QBIT_USER"], 'password': CONFIG["QBIT_PASS"]
-            })
-            return r.status_code == 200 or "Ok." in r.text
+            }, timeout=15)
+            return r.status_code == 200 and r.text.strip() == "Ok."
         except Exception as e:
             logger.error(f"Login Error: {e}")
             return False
 
-    def apply_optimizations(self):
-        prefs = {
-            'max_connec': 500,
-            'enable_os_cache': False,
-            'preallocate_all': True,
-            'queueing_enabled': False,
-            'autorun_enabled': False, # 确保添加任务时不自动开始，由脚本控制
-        }
+    def _post(self, endpoint, data):
+        r = self.s.post(f"{self.base_url}/api/v2/{endpoint}", data=data,
+                        timeout=CONFIG["QBIT_TIMEOUT"])
+        r.raise_for_status()
+        return r
+
+    def _get(self, endpoint, params=None):
+        r = self.s.get(f"{self.base_url}/api/v2/{endpoint}", params=params,
+                       timeout=CONFIG["QBIT_TIMEOUT"])
+        r.raise_for_status()
+        return r
+
+    def detect_api(self):
         try:
-            self.s.post(f"{self.base_url}/api/v2/app/setPreferences", data={'json': json.dumps(prefs)})
-            logger.info("✅ qBittorrent 性能参数已注入")
-        except: pass
+            version = self._get("app/webapiVersion").text.strip()
+            major, minor = (int(x) for x in version.split(".")[:2])
+            self.api_version = (major, minor)
+            logger.info("qBittorrent WebAPI version: %s", version)
+        except Exception as exc:
+            logger.warning("Could not identify qBittorrent API version: %s", exc)
+            self.api_version = (2, 0)
+
+    def _uses_start_stop(self):
+        return self.api_version is not None and self.api_version >= (2, 11)
 
     def add_torrent(self, url):
-        # 添加时强制暂停
+        if not isinstance(url, str) or not url.strip():
+            return False
         try:
-            self.s.post(f"{self.base_url}/api/v2/torrents/add", 
-                       data={'urls': url, 'paused': 'true', 'savepath': CONFIG["DOWNLOAD_DIR"], 'root_folder': 'true'})
+            data = {'urls': url, 'savepath': CONFIG["DOWNLOAD_DIR"],
+                    'root_folder': 'true'}
+            data['stopped' if self._uses_start_stop() else 'paused'] = 'true'
+            self._post('torrents/add', data)
             return True
-        except: return False
+        except requests.RequestException as exc:
+            logger.error("Cannot add torrent: %s", exc)
+            return False
 
     def get_torrents(self):
-        try: return self.s.get(f"{self.base_url}/api/v2/torrents/info").json()
-        except: return []
+        return self._get('torrents/info').json()
 
     def get_files(self, hash_str):
-        try: return self.s.get(f"{self.base_url}/api/v2/torrents/files", params={'hash': hash_str}).json()
-        except: return []
+        return self._get('torrents/files', {'hash': hash_str}).json()
 
     def set_priority(self, hash_str, file_indexes, prio):
-        # ⚠️ 修复：改为 POST 请求
-        if not file_indexes: return
-        ids = '|'.join(map(str, file_indexes))
-        self.s.post(f"{self.base_url}/api/v2/torrents/filePrio", data={'hash': hash_str, 'id': ids, 'priority': prio})
+        if file_indexes:
+            self._post('torrents/filePrio', {'hash': hash_str,
+                      'id': '|'.join(map(str, file_indexes)), 'priority': prio})
 
     def resume(self, hash_str):
-        # ⚠️ 修复：改为 POST 请求
-        self.s.post(f"{self.base_url}/api/v2/torrents/resume", data={'hashes': hash_str})
-        # 额外操作：强制重新宣告 (Reannounce) 以加速磁力链连接
-        self.s.post(f"{self.base_url}/api/v2/torrents/reannounce", data={'hashes': hash_str})
-    
+        endpoint = 'start' if self._uses_start_stop() else 'resume'
+        self._post('torrents/' + endpoint, {'hashes': hash_str})
+
+    def reannounce(self, hash_str):
+        self._post('torrents/reannounce', {'hashes': hash_str})
+
     def delete(self, hash_str):
-        # ⚠️ 修复：改为 POST 请求
-        self.s.post(f"{self.base_url}/api/v2/torrents/delete", data={'hashes': hash_str, 'deleteFiles': 'true'})
+        self._post('torrents/delete', {'hashes': hash_str, 'deleteFiles': 'true'})
 
 qbit = QbitClient()
 
@@ -213,6 +231,19 @@ class Scheduler(threading.Thread):
         super().__init__()
         self.daemon = True
         self.upload_slots = threading.Semaphore(CONFIG["MAX_UPLOAD_THREADS"])
+        self.upload_retry_at = {}
+        self.upload_attempts = {}
+        # Recover jobs whose worker disappeared during a previous shutdown.
+        session = Session()
+        try:
+            stuck = session.query(FileItem).filter_by(status=3).all()
+            for item in stuck:
+                item.status = 2
+            if stuck:
+                logger.warning("Recovered %d interrupted upload tasks", len(stuck))
+            session.commit()
+        finally:
+            Session.remove()
         # 用于记录磁力链尝试激活的次数，防止日志刷屏
         self.resume_attempts = {} 
 
@@ -241,7 +272,7 @@ class Scheduler(threading.Thread):
             # 1. 磁力链 "卡顿/死锁" 救援逻辑
             # 现象: 任务处于 pausedDL, 且名字是 Hash (没变) 或大小极小
             # =====================================================
-            is_stuck = t['state'] == 'pausedDL' and (t['name'] == t_hash or t['total_size'] < 10240)
+            is_stuck = t['state'] in ('pausedDL', 'stoppedDL') and (t['name'] == t_hash or t['total_size'] < 10240)
             
             if is_stuck and not db_t:
                 count = self.resume_attempts.get(t_hash, 0) + 1
@@ -252,18 +283,18 @@ class Scheduler(threading.Thread):
                     qbit.resume(t_hash)
                 elif count == 3:
                     logger.info(f"⚠️ [第3次] 磁力链无反应，强制宣告: {t_hash[:6]}... (Reannounce)")
-                    qbit.s.post(f"{CONFIG['QBIT_URL']}/api/v2/torrents/reannounce", data={'hashes': t_hash})
+                    qbit.reannounce(t_hash)
                     qbit.resume(t_hash)
                 elif count >= 5:
                     # 5次没反应，使用“强制开始”无视队列限制
                     if count % 5 == 0: # 降低日志频率
                         logger.info(f"🔥 [第{count}次] 暴力唤醒: {t_hash[:6]}... (ForceStart)")
-                        qbit.s.post(f"{CONFIG['QBIT_URL']}/api/v2/torrents/setForceStart", data={'hashes': t_hash, 'value': 'true'})
+                        qbit._post('torrents/setForceStart', {'hashes': t_hash, 'value': 'true'})
                 
                 continue # 继续下一个循环，等它元数据出来
             
             # 如果状态变成了 metaDL (下载元数据中)，清除计数器，静静等待
-            if t['state'] in ['metaDL', 'allocating', 'checkingUP']:
+            if t['state'] in ['metaDL', 'allocating', 'checkingUP', 'checkingDL']:
                 if t_hash in self.resume_attempts: del self.resume_attempts[t_hash]
                 continue
 
@@ -287,13 +318,18 @@ class Scheduler(threading.Thread):
                 all_ids = []
                 valid_count = 0
                 for i, f in enumerate(files):
-                    all_ids.append(i)
+                    file_index = f.get("index", i)
+                    all_ids.append(file_index)
                     # 过滤垃圾文件
                     if f['size'] < 10 * 1024: continue 
                     
-                    abs_path = os.path.join(CONFIG["DOWNLOAD_DIR"], f['name'])
+                    abs_path = os.path.realpath(os.path.join(CONFIG["DOWNLOAD_DIR"], f['name']))
+                    download_root = os.path.realpath(CONFIG["DOWNLOAD_DIR"])
+                    if os.path.commonpath((download_root, abs_path)) != download_root:
+                        logger.error("Torrent path escapes download root: %s", f["name"])
+                        continue
                     item = FileItem(
-                        torrent_hash=t_hash, index=i,
+                        torrent_hash=t_hash, index=file_index,
                         path=abs_path, rel_path=f['name'],
                         size=f['size'], status=0
                     )
@@ -332,9 +368,10 @@ class Scheduler(threading.Thread):
             # 筛选出属于该种子的 DB 任务
             tasks = [f for f in downloading if f.torrent_hash == h]
             
+            indexed_files = {item.get("index", i): item for i, item in enumerate(q_files)}
             for f in tasks:
-                if f.index >= len(q_files): continue
-                qf = q_files[f.index]
+                qf = indexed_files.get(f.index)
+                if not qf: continue
                 
                 if f.started_at == 0:
                     f.started_at = now
@@ -429,6 +466,7 @@ class Scheduler(threading.Thread):
                     # 获取该种子所有文件的实时信息
                     q_files_info = qbit.get_files(h) 
                     for idx, info in enumerate(q_files_info):
+                        idx = info.get("index", idx)
                         # availability: 0~1表示完成度，>1表示副本数(种子多)
                         # 有些版本可能返回 -1 表示未知，归一化为 0
                         avail = info.get('availability', 0)
@@ -471,7 +509,7 @@ class Scheduler(threading.Thread):
                 # 获取健康度用于日志
                 h_val = health_map.get((f.torrent_hash, f.index), 0)
                 
-                if f.size < budget:
+                if f.size <= budget:
                     # 只有健康度 >= 1 或者 整个队列都没好资源了勉强下
                     # 这里做个策略：如果健康度 < 0.9，尽量跳过，除非硬盘很空
                     if h_val < 0.9 and budget < 10 * 1024**3:
@@ -514,11 +552,11 @@ class Scheduler(threading.Thread):
 
             tasks = [f for f in downloading if f.torrent_hash == h]
             
+            indexed_files = {item.get("index", i): item for i, item in enumerate(files_stats)}
             for t in tasks:
-                if t.index < len(files_stats):
-                    qs = files_stats[t.index]
-                    # 进度 >= 1.0 (或 100%)
-                    if qs['progress'] >= 0.9999:
+                qs = indexed_files.get(t.index)
+                if qs is not None:
+                    if qs.get('progress', 0) >= 1.0 and os.path.isfile(t.path) and os.path.getsize(t.path) == t.size:
                         logger.info(f"✅ 下载完成: {t.rel_path}")
                         t.status = 2 # Ready to upload
                         # 注意：这里不设 priority=0，防止 qBit 在做种/检查时出错
@@ -533,6 +571,10 @@ class Scheduler(threading.Thread):
         ready = session.query(FileItem).filter_by(status=2).all()
         
         for f in ready:
+            if time.time() < self.upload_retry_at.get(f.id, 0):
+                continue
+            if self.upload_attempts.get(f.id, 0) >= CONFIG["UPLOAD_MAX_RETRIES"]:
+                continue
             if self.upload_slots.acquire(blocking=False):
                 f.status = 3 # Uploading
                 session.commit()
@@ -545,50 +587,66 @@ class Scheduler(threading.Thread):
         Session.remove()
 
     def run_rclone(self, fid, local, rel, th, idx):
-        """Rclone 上传线程 (修复死锁版)"""
+        """Move a completed file with bounded execution and guaranteed slot release."""
         remote_sub = os.path.dirname(rel)
         remote_path = f"{CONFIG['RCLONE_REMOTE']}{CONFIG['RCLONE_DEST_PATH']}/{remote_sub}"
-        
-        cmd = ["rclone", "move", local, remote_path] + RCLONE_FLAGS
-        
-        logger.info(f"🚀 开始上传: {os.path.basename(local)}")
+        cmd = ["rclone", "copyto", local, remote_path.rstrip("/") + "/" + os.path.basename(local)] + RCLONE_FLAGS
+        success = False
+        error = ""
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True)
-            success = (res.returncode == 0)
-        except Exception as e:
-            logger.error(f"Rclone 调用异常: {e}")
-            success = False
-        
-        # --- 数据库更新操作 (包裹在重试逻辑中) ---
-        def update_status():
-            session = Session()
+            if not os.path.isfile(local):
+                raise FileNotFoundError(f"Local download missing: {local}")
+            res = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=CONFIG["UPLOAD_TIMEOUT"]
+            )
+            success = res.returncode == 0
+            if success and CONFIG["VERIFY_UPLOAD_SIZE"]:
+                check = subprocess.run(["rclone", "size", "--json", remote_path.rstrip("/") + "/" + os.path.basename(local)],
+                                       capture_output=True, text=True, timeout=CONFIG["UPLOAD_TIMEOUT"])
+                if check.returncode != 0 or int(json.loads(check.stdout).get("bytes", -1)) != os.path.getsize(local):
+                    success = False
+                    error = "Remote size verification failed"
+            if not success and not error:
+                error = (res.stderr or res.stdout or f"exit code {res.returncode}")[-500:]
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            error = str(exc)
+        finally:
             try:
-                # 使用 Session.get 替代 query.get (SQLAlchemy 2.0 写法，但也兼容旧版)
-                f = session.query(FileItem).filter_by(id=fid).first() 
-                if not f: return
-                
                 if success:
-                    f.status = 4 # Done
-                    logger.info(f"🎉 上传成功: {os.path.basename(local)}")
-                    # 告诉 qBit 停止关注此文件
-                    qbit.set_priority(th, [idx], 0)
-                    
-                    # 清理残留
-                    if os.path.exists(local): os.remove(local)
-                    parts = local + ".parts"
-                    if os.path.exists(parts): os.remove(parts)
+                    self.upload_attempts.pop(fid, None)
+                    self.upload_retry_at.pop(fid, None)
                 else:
-                    f.status = 2 # 失败回退
-                    err = res.stderr.strip().split('\n')[-1] if res.stderr else "Unknown"
-                    logger.error(f"❌ 上传失败: {err}")
-                    
-                session.commit()
+                    attempts = self.upload_attempts.get(fid, 0) + 1
+                    self.upload_attempts[fid] = attempts
+                    self.upload_retry_at[fid] = time.time() + CONFIG["UPLOAD_RETRY_DELAY"] * min(2 ** (attempts - 1), 32)
+                session = Session()
+                try:
+                    item = session.query(FileItem).filter_by(id=fid).first()
+                    if item:
+                        item.status = 4 if success else 2
+                        item.failed_reason = "" if success else error[-500:]
+                        session.commit()
+                finally:
+                    Session.remove()
+                if success:
+                    # Copy was verified; only now clean up the local data.
+                    try:
+                        os.remove(local)
+                    except OSError:
+                        logger.exception("Uploaded but could not remove local file: %s", local)
+                    # qBittorrent may still reference a removed file.
+                    try:
+                        qbit.set_priority(th, [idx], 0)
+                    except Exception:
+                        logger.exception("Failed to update qBittorrent priority for %s", rel)
+                    logger.info("Uploaded %s", rel)
+                else:
+                    logger.error("Upload failed for %s: %s", rel, error)
+            except Exception:
+                logger.exception("Could not persist upload result for %s", rel)
             finally:
-                Session.remove()
-
-        # 执行更新
-        db_execute(update_status)
-        self.upload_slots.release()
+                self.upload_slots.release()
 
     def run(self):
         logger.info("🚀 QFlow 调度核心已启动")
@@ -765,14 +823,18 @@ def api_stats():
 def api_add():
     url = request.json.get('url')
     if url:
-        qbit.add_torrent(url)
+        if not qbit.add_torrent(url):
+            return jsonify({'status': 'error', 'message': 'qBittorrent rejected the task'}), 502
     return jsonify({'status': 'ok'})
 
 @app.route('/api/del', methods=['POST'])
 def api_del():
     h = request.json.get('hash')
     if h:
-        qbit.delete(h)
+        try:
+            qbit.delete(h)
+        except requests.RequestException as exc:
+            return jsonify({"status": "error", "message": str(exc)}), 502
         session = Session()
         session.query(Torrent).filter_by(hash=h).delete()
         session.query(FileItem).filter_by(torrent_hash=h).delete()

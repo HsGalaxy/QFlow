@@ -138,6 +138,9 @@ celerybeat.pid
 .env
 .envrc
 .venv
+qflow.db
+qflow.db-shm
+qflow.db-wal
 env/
 venv/
 ENV/
